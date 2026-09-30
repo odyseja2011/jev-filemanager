@@ -33,6 +33,10 @@ export OPENROUTER_API_KEY='...'
 migrator db migrate
 ```
 
+The SQL migrations are read from the repository's `sql/` directory (an editable install finds it
+automatically; otherwise set `MIGRATOR_SQL_DIR`). Applied migrations are checksummed: editing one after
+it was applied is refused.
+
 Requires Python ≥ 3.11, PostgreSQL, and on the machine that *runs the generated batches*: bash ≥ 4,
 GNU coreutils (`cp`, `ln`, `rm`, `stat`, `sha256sum`) and the `migrator` executable (used only for
 `audit emit`). Secrets are read from environment variables named in the config; they are never

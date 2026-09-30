@@ -10,6 +10,7 @@ import csv
 import getpass
 import hashlib
 import json
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -583,6 +584,12 @@ def export_review_csv(ctx: RunContext, output: str | Path | None = None) -> Path
     for row in review_rows(ctx):
         w.writerow(row)
     out = Path(output) if output else ctx.path("review", "review.csv")
+    if output is not None:
+        from migrator.paths import is_within
+        resolved = os.path.abspath(output)
+        for root in ctx.cfg.migration_roots:
+            if is_within(resolved, root):
+                raise ClassifyError(f"refusing to write {resolved}: it lies beneath migration root {root}")
     if output is None:
         write_replaceable_file(out, buf.getvalue().encode(), ctx.guard)
     else:

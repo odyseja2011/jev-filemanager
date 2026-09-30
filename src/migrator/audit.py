@@ -421,17 +421,19 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
         raise AuditError(f"event type {event_type!r} may not be emitted from Bash")
     uuid.UUID(trace_id)
     fd = spool.lock(trace_id)
+    conn = None
     try:
+        db_head: tuple[int, str] | None = None
+        if dsn:
+            try:
+                conn = psycopg.connect(dsn, connect_timeout=3, autocommit=True,
+                                       row_factory=psycopg.rows.dict_row)
+                db_head = get_head(conn, trace_id)
+            except Exception:
+                conn = None
+                db_head = None      # PostgreSQL unavailable: rely on spool / batch metadata
         head = spool.head(trace_id)
         if head is None:
-            db_head: tuple[int, str] | None = None
-            if dsn:
-                try:
-                    with psycopg.connect(dsn, connect_timeout=3, autocommit=True,
-                                         row_factory=psycopg.rows.dict_row) as c:
-                        db_head = get_head(c, trace_id)
-                except psycopg.Error:
-                    db_head = None   # PostgreSQL unavailable: rely on the batch metadata
             if expect_sequence is None or expect_hash is None:
                 if db_head is None or db_head[0] == 0:
                     raise AuditError("no chain head known: pass --expect-sequence/--expect-hash")
@@ -442,6 +444,15 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
                         f"trace head in PostgreSQL is {db_head[0]}:{db_head[1][:12]} but the batch "
                         f"expects {expect_sequence}:{expect_hash[:12]}; the batch is stale")
                 head = (expect_sequence, expect_hash)
+        elif db_head is not None and db_head[0] > head[0]:
+            # The database moved on (e.g. reconciliation events).  Continue from its head, but only
+            # if our own last event is really part of that chain.
+            r = conn.execute("SELECT event_hash FROM audit_event WHERE trace_id = %s AND sequence_no = %s",
+                             (trace_id, head[0])).fetchone()
+            if r is None or r["event_hash"].strip() != head[1]:
+                raise StaleChainError("local spool and PostgreSQL disagree about this trace; "
+                                      "run `audit sync` and inspect the divergence")
+            head = db_head
         spec = EventSpec(uuid.UUID(trace_id), event_type, actor, source, payload or {},
                          uuid.UUID(file_id) if file_id else None,
                          uuid.UUID(operation_id) if operation_id else None,
@@ -451,14 +462,18 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
     finally:
         spool.unlock(fd)
     synced = False
-    if dsn:
+    if conn is not None:
         try:
-            with psycopg.connect(dsn, connect_timeout=3, autocommit=True) as c:
-                synced = push_event(c, ev)
+            synced = push_event(conn, ev)
             if synced:
                 spool.mark_synced(path)
-        except psycopg.Error:
+        except Exception:   # the durable spool copy is the guarantee; PostgreSQL is best-effort here
             synced = False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return EmitResult(ev, synced)
 
 
@@ -504,8 +519,33 @@ def sync_spool(conn: psycopg.Connection, run_id: uuid.UUID | str, spool: Spool) 
         if trace not in known:
             rep.problems.append(ChainProblem(trace, "UNKNOWN_TRACE", "spooled events for a trace not in this run"))
             continue
-        first = events[0]
-        internal = verify_trace_events(trace, events, first.sequence_no, first.previous_event_hash)
+        internal: list[ChainProblem] = []
+        prev_ev: AuditEvent | None = None
+        for ev in events:
+            if recompute_hash(ev) != ev.event_hash:
+                internal.append(ChainProblem(trace, "MUTATED_EVENT",
+                                             f"sequence {ev.sequence_no}: stored hash does not match content"))
+            if prev_ev is not None and ev.sequence_no == prev_ev.sequence_no + 1:
+                if ev.previous_event_hash != prev_ev.event_hash:
+                    internal.append(ChainProblem(trace, "BROKEN_LINK",
+                                                 f"sequence {ev.sequence_no}: previous hash does not match predecessor"))
+            elif prev_ev is not None and ev.sequence_no <= prev_ev.sequence_no:
+                internal.append(ChainProblem(trace, "DUPLICATE_OR_REORDERED",
+                                             f"sequence {ev.sequence_no} follows {prev_ev.sequence_no}"))
+            elif ev.sequence_no > 1:
+                # first spooled event, or a jump because the database appended events in between
+                # (e.g. reconciliation): the predecessor must exist in PostgreSQL and match.
+                r = conn.execute("SELECT event_hash FROM audit_event WHERE trace_id = %s AND sequence_no = %s",
+                                 (trace, ev.sequence_no - 1)).fetchone()
+                if r is None:
+                    internal.append(ChainProblem(trace, "GAP", f"predecessor of sequence {ev.sequence_no} "
+                                                              "is not in PostgreSQL"))
+                elif r["event_hash"].strip() != ev.previous_event_hash:
+                    internal.append(ChainProblem(trace, "DIVERGED", f"sequence {ev.sequence_no} does not "
+                                                                    "continue the database chain"))
+            elif ev.previous_event_hash != C.ZERO_HASH:
+                internal.append(ChainProblem(trace, "BROKEN_LINK", "first event must start from the zero hash"))
+            prev_ev = ev
         if any(e.run_id != rid or e.trace_id != trace for e in events):
             internal.append(ChainProblem(trace, "FOREIGN_EVENT", "spooled event belongs to another run/trace"))
         if any(e.source != C.SRC_BASH or e.event_type not in C.BASH_EVENT_TYPES for e in events):

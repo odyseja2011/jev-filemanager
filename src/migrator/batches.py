@@ -79,9 +79,45 @@ NOT_RUN=0
 ABORT=0
 AUDIT_BROKEN=0
 
+AUDIT_SERVER_UP=0
+
+audit_start() {
+    # One persistent helper per batch (imports psycopg once, keeps one connection). Falls back to
+    # one `audit emit` process per event, which is slower but equally safe.
+    [[ "$AUDIT_MODE" == serve ]] || return 0
+    coproc AUDITOR { "$MIGRATOR_BIN" audit serve --run "$RUN_ID" --run-dir "$RUN_DIR"; }
+    local reply=""
+    if printf '%s\0' PING "" >&"${AUDITOR[1]}" 2>/dev/null \
+            && read -r -t 30 -u "${AUDITOR[0]}" reply 2>/dev/null && [[ "$reply" == OK ]]; then
+        AUDIT_SERVER_UP=1
+    else
+        log "warning: audit helper did not start; falling back to one process per audit event"
+    fi
+}
+
+audit_stop() {
+    if (( AUDIT_SERVER_UP )); then
+        AUDIT_SERVER_UP=0
+        if [[ -n ${AUDITOR[1]:-} ]]; then
+            eval "exec ${AUDITOR[1]}>&-"          # EOF on the helper's stdin ends it
+            wait "${AUDITOR_PID:-}" 2>/dev/null
+        fi
+    fi
+}
+
 audit_emit() {
     # audit_emit EVENT [key=value ...]  -> records audit information only
     local event="$1"; shift
+    if (( AUDIT_SERVER_UP )); then
+        local reply=""
+        # if the helper died, bash unsets the coproc variables
+        [[ -n ${AUDITOR[1]:-} && -n ${AUDITOR[0]:-} ]] || { log "audit: helper is gone"; return 1; }
+        printf '%s\0' "$RUN_ID" "$TRACE_ID" "$FILE_ID" "$OP_ID" "$BATCH_ID" "$PREV_SEQ" "$PREV_HASH" \
+            "$ACTOR" "$event" "$@" "" >&"${AUDITOR[1]}" 2>/dev/null || { log "audit: helper is gone"; return 1; }
+        read -r -t 300 -u "${AUDITOR[0]}" reply || { log "audit: no reply from helper"; return 1; }
+        [[ "$reply" == OK ]] || { log "audit: $reply"; return 1; }
+        return 0
+    fi
     local kv=() a
     for a in "$@"; do kv+=(--kv "$a"); done
     "$MIGRATOR_BIN" audit emit --run "$RUN_ID" --run-dir "$RUN_DIR" --trace "$TRACE_ID" \
@@ -280,6 +316,7 @@ run_operation() {
 }
 
 finish() {
+    audit_stop
     printf 'Batch complete\nSuccess: %s\nAlready complete: %s\nFailed: %s\nBlocked: %s\n' \
         "$SUCCESS" "$ALREADY_COMPLETE" "$FAILED" "$BLOCKED"
     (( NOT_RUN )) && printf 'Not run (batch stopped): %s\n' "$NOT_RUN"
@@ -289,6 +326,7 @@ finish() {
 }
 
 preflight || { log "batch preflight failed; nothing was changed"; exit 2; }
+audit_start
 '''
 
 
@@ -325,6 +363,8 @@ def render_batch_script(meta: BatchMeta, ops: list[BatchOp]) -> str:
         'STOP_ON_ERROR="${STOP_ON_ERROR:-0}"      # 1 = stop the batch at the first failed/blocked operation',
         'MIGRATOR_BIN="${MIGRATOR_BIN:-migrator}"  # only used for `audit emit`; never touches migration files',
         'VERIFY_SELF="${VERIFY_SELF:-1}"',
+        'AUDIT_MODE="${AUDIT_MODE:-serve}"          # serve = one helper process; process = one `audit emit` per event',
+        "trap '' PIPE                               # a dead audit helper must fail the audit, not kill the shell",
         f'ACTOR={_q(meta.script_name)}":${{USER:-unknown}}@$(hostname 2>/dev/null || echo unknown)"',
     ])
     calls = []

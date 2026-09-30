@@ -48,7 +48,7 @@ def test_all_dynamic_values_round_trip_through_shell_parsing():
     name must come back byte-identical, proving nothing is expanded or split."""
     import shlex
     text = render()
-    tail = text.split('preflight || { log "batch preflight failed; nothing was changed"; exit 2; }\n')[1]
+    tail = text.split('preflight || { log "batch preflight failed; nothing was changed"; exit 2; }\naudit_start\n')[1]
     tokens = shlex.split(tail)
     assert tokens[-1] == "finish"
     calls, cur = [], []

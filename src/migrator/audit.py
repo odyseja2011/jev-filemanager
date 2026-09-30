@@ -405,13 +405,15 @@ class Spool:
 class EmitResult:
     event: AuditEvent
     db_synced: bool
+    db_error: bool = False     # a PostgreSQL error occurred (connection should be discarded)
 
 
 def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, actor: str,
                payload: dict[str, Any] | None = None, file_id: str | None = None,
                operation_id: str | None = None, batch_id: str | None = None,
                expect_sequence: int | None = None, expect_hash: str | None = None,
-               dsn: str | None = None, source: str = C.SRC_BASH) -> EmitResult:
+               dsn: str | None = None, source: str = C.SRC_BASH,
+               conn: "psycopg.Connection | None" = None) -> EmitResult:
     """Spool an event durably, then best-effort push it to PostgreSQL.
 
     Success is reported only after the local file is fsynced.  This function
@@ -421,15 +423,20 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
         raise AuditError(f"event type {event_type!r} may not be emitted from Bash")
     uuid.UUID(trace_id)
     fd = spool.lock(trace_id)
-    conn = None
+    owns_conn = conn is None
+    db_error = False
     try:
         db_head: tuple[int, str] | None = None
-        if dsn:
+        if conn is not None or dsn:
             try:
-                conn = psycopg.connect(dsn, connect_timeout=3, autocommit=True,
-                                       row_factory=psycopg.rows.dict_row)
+                if conn is None:
+                    conn = psycopg.connect(dsn, connect_timeout=3, autocommit=True,
+                                           row_factory=psycopg.rows.dict_row)
                 db_head = get_head(conn, trace_id)
             except Exception:
+                db_error = True
+                if owns_conn and conn is not None:
+                    conn.close()
                 conn = None
                 db_head = None      # PostgreSQL unavailable: rely on spool / batch metadata
         head = spool.head(trace_id)
@@ -481,12 +488,114 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
                 spool.mark_synced(path)
         except Exception:   # the durable spool copy is the guarantee; PostgreSQL is best-effort here
             synced = False
+            db_error = True
         finally:
+            if owns_conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return EmitResult(ev, synced, db_error)
+
+
+# --- persistent audit helper (one process per batch) ----------------------------------------------
+
+class AuditServer:
+    """Serves audit requests from one running batch over a pipe.
+
+    Protocol (NUL-delimited fields, an empty field ends a record):
+      run, trace, file, operation, batch, expect_seq, expect_hash, actor, event, key=value...
+    Reply: one line, ``OK`` only *after* the event file has been fsynced, else ``ERR <reason>``.
+    Importing psycopg and connecting once instead of per event is what makes large batches feasible.
+    """
+
+    BACKOFF_SECONDS = 30.0
+
+    def __init__(self, spool: Spool, dsn: str | None, clock=None):
+        import time
+        self.spool, self.dsn = spool, dsn
+        self._clock = clock or time.monotonic
+        self._conn: psycopg.Connection | None = None
+        self._retry_at = 0.0
+
+    def _connection(self):
+        if not self.dsn:
+            return None
+        if self._conn is not None and not self._conn.closed:
+            return self._conn
+        if self._clock() < self._retry_at:
+            return None
+        try:
+            self._conn = psycopg.connect(self.dsn, connect_timeout=3, autocommit=True,
+                                         row_factory=psycopg.rows.dict_row)
+        except Exception:
+            self._conn = None
+            self._retry_at = self._clock() + self.BACKOFF_SECONDS
+        return self._conn
+
+    def _drop(self) -> None:
+        if self._conn is not None:
             try:
-                conn.close()
+                self._conn.close()
             except Exception:
                 pass
-    return EmitResult(ev, synced)
+        self._conn = None
+        self._retry_at = self._clock() + self.BACKOFF_SECONDS
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def handle(self, rec: list[str]) -> str:
+        if rec and rec[0] == "PING":
+            return "OK"
+        if len(rec) < 9:
+            return "ERR malformed request"
+        run, trace, file_id, op, batch, seq, h, actor, event = [None if x == "-" else x for x in rec[:9]]
+        actor = actor or "unknown"
+        payload: dict[str, str] = {}
+        for item in rec[9:]:
+            k, sep, v = item.partition("=")
+            if not sep:
+                return f"ERR malformed key=value {item!r}"
+            payload[k] = v
+        try:
+            conn = self._connection()
+            res = emit_event(self.spool, run_id=run, trace_id=trace, event_type=event, actor=actor,
+                             payload=payload, file_id=file_id or None, operation_id=op or None,
+                             batch_id=batch or None, expect_sequence=int(seq) if seq else None,
+                             expect_hash=h or None, dsn=None, conn=conn)
+        except StaleChainError as exc:
+            return f"ERR stale {exc}"
+        except (AuditError, ValueError, OSError) as exc:
+            return f"ERR {exc}"
+        if res.db_error:
+            self._drop()
+        return "OK"
+
+    def serve(self, fin: int, fout: int) -> None:
+        buf, fields = b"", []
+        while True:
+            chunk = os.read(fin, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                i = buf.find(b"\0")
+                if i < 0:
+                    break
+                raw, buf = buf[:i], buf[i + 1:]
+                if raw:
+                    fields.append(raw.decode("utf-8", "surrogateescape"))
+                    continue
+                reply = self.handle(fields)
+                fields = []
+                os.write(fout, (reply.replace("\n", " ") + "\n").encode("utf-8", "replace"))
+        self.close()
 
 
 # --- spool -> PostgreSQL synchronization ---------------------------------------------

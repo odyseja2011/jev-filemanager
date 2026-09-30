@@ -103,3 +103,40 @@ def test_unreachable_postgres_does_not_lose_event(tmp_path):
     assert res.db_synced is False
     assert len(spool.event_files(trace)) == 1
     assert spool.counts()["pending"] == 1
+
+
+def test_audit_server_protocol_spools_before_replying_ok(tmp_path):
+    from migrator.audit import AuditServer
+    spool = Spool(tmp_path / "spool")
+    srv = AuditServer(spool, dsn=None)
+    trace, op = str(uuid.uuid4()), str(uuid.uuid4())
+    assert srv.handle(["PING"]) == "OK"
+    rec = [RUN, trace, str(uuid.uuid4()), op, str(uuid.uuid4()), "3", "c" * 64, "actor", "COPY_STARTED", "temp=/x y", "n=1"]
+    assert srv.handle(rec) == "OK"
+    files = spool.event_files(trace)                     # durable by the time OK was returned
+    assert len(files) == 1
+    ev = Spool.load(files[0])
+    assert (ev.sequence_no, ev.previous_event_hash, ev.payload) == (4, "c" * 64, {"temp": "/x y", "n": "1"})
+    assert srv.handle(rec)[:2] == "OK" and len(spool.event_files(trace)) == 2      # chains on locally
+    assert srv.handle(rec[:5]).startswith("ERR")
+    bad = list(rec)
+    bad[8] = "ROUTE_ASSIGNED"
+    assert srv.handle(bad).startswith("ERR")
+
+
+def test_audit_server_over_a_real_pipe(tmp_path):
+    import os
+    import threading
+    from migrator.audit import AuditServer
+    spool = Spool(tmp_path / "spool")
+    r1, w1 = os.pipe()
+    r2, w2 = os.pipe()
+    t = threading.Thread(target=lambda: AuditServer(spool, None).serve(r1, w2), daemon=True)
+    t.start()
+    trace = str(uuid.uuid4())
+    fields = [RUN, trace, "-", "-", "-", "1", "d" * 64, "a", "COPY_STARTED", "k=multi\nline value"]
+    os.write(w1, b"".join(f.encode() + b"\0" for f in fields) + b"\0")
+    assert os.read(r2, 100) == b"OK\n"
+    os.close(w1)
+    t.join(5)
+    assert Spool.load(spool.event_files(trace)[0]).payload == {"k": "multi\nline value"}

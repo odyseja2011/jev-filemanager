@@ -1,0 +1,144 @@
+version: 1
+
+migration:
+  name: media-library-migration
+
+workspace:
+  # Only place the Python application writes to (plus PostgreSQL). Must not overlap any source/target root.
+  path: /mnt/data/MIGRATION_WORKSPACE
+
+database:
+  dsn_env: MIGRATOR_DATABASE_URL      # NAME of the environment variable, never the secret itself
+
+openrouter:
+  api_key_env: OPENROUTER_API_KEY     # NAME of the environment variable
+  endpoint: https://openrouter.ai/api/alpha/decisions
+  model: typesafe/jev-1.13
+  timeout_seconds: 30
+  concurrency: 8
+  retries: 3
+
+scope:
+  # allow_overlapping_sources: false   # explicit opt-ins; both default to false
+  # allow_targets_in_sources: false
+  sources:
+    - id: media
+      path: /mnt/data/MEDIA
+      cross_mounts: true
+      include:
+        - "**/*"
+      exclude: []
+
+  targets:
+    - id: MOVIES
+      path: /mnt/data/MEDIA_LIBRARY/MOVIES
+      description: >
+        Movies and feature-length live-action film content.
+
+    - id: SERIES
+      path: /mnt/data/MEDIA_LIBRARY/SERIES
+      description: >
+        Episodic live-action television series and shows.
+
+    - id: ANIME
+      path: /mnt/data/MEDIA_LIBRARY/ANIME
+      description: >
+        Japanese anime series and anime films.
+
+    - id: ANIMATION
+      path: /mnt/data/MEDIA_LIBRARY/ANIMATION
+      description: >
+        Animated films and series that should not be classified as anime or kids-only content.
+
+    - id: KIDS
+      path: /mnt/data/MEDIA_LIBRARY/KIDS
+      description: >
+        Media primarily intended for children.
+
+    - id: MUSIC
+      path: /mnt/data/MEDIA_LIBRARY/MUSIC
+      description: >
+        Music recordings, albums, discographies, soundtracks and individual songs.
+
+    - id: AUDIOBOOKS
+      path: /mnt/data/MEDIA_LIBRARY/AUDIOBOOKS
+      description: >
+        Audiobooks, audio dramas and spoken-word book productions.
+
+    - id: PODCASTS
+      path: /mnt/data/MEDIA_LIBRARY/PODCASTS
+      description: >
+        Podcasts and recurring spoken-word episodic audio programs.
+
+    - id: BOOKS
+      path: /mnt/data/MEDIA_LIBRARY/BOOKS
+      description: >
+        Ebooks, books, comics, manga, light novels, manuals and other text-based reading material.
+
+inventory:
+  regular_files_only: true
+  follow_symlinks: false
+  cross_mounts_default: true
+
+  checksum:
+    algorithm: sha256                 # the only supported algorithm in v1
+    workers: 4
+    read_block_mib: 8
+    stability_retries: 2
+
+  hardlinks:
+    action: review                    # review | block  (hardlinked source files are never migrated automatically)
+
+routing:
+  confidence_threshold: 0.90
+  max_depth: 64
+
+  samples:
+    max_child_directory_names: 80
+    max_file_names: 120
+    max_ancestor_names: 8
+    max_state_characters: 24000
+
+  directory_mapping:
+    include_classified_directory_name: false
+
+  low_confidence_directory_action: descend
+  low_confidence_file_action: review
+
+  cache_decisions: true
+
+planning:
+  exact_path_collision: review
+  casefold_path_collision: review
+  existing_target_same_hash: review
+  # NOTE: the specification's collision section says "same target, different SHA-256 => BLOCKED".
+  # This knob accepts review|block; the built-in default is `block`. Both keep the file out of
+  # every batch - the only difference is the label operators see.
+  existing_target_different_hash: review
+  missing_checksum: block
+  changed_source: block
+
+batches:
+  max_operations: 100
+  use_absolute_paths: true
+  copy_verify_delete: true
+  use_reflink_auto: true
+  remove_empty_source_directories: false
+  overwrite_existing_targets: false
+
+permissions:
+  preserve_source_owner: false
+  preserve_source_group: false
+  preserve_source_mode: false
+  preserve_source_acl: false
+  preserve_source_xattrs: false
+  inherit_destination_permissions: true
+
+audit:
+  postgres: true
+  local_spool: true
+  hash_chain: true
+  require_durable_event_before_mutation: true
+
+reconciliation:
+  verify_sha256: true

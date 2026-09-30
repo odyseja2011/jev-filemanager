@@ -386,6 +386,17 @@ def audit_emit(run: str = RunOpt,
         typer.echo(f"{res.event.sequence_no} {res.event.event_hash} db_synced={res.db_synced}")
 
 
+@audit_app.command("serve")
+def audit_serve(run: str = RunOpt, run_dir: Path = typer.Option(..., "--run-dir"),
+                no_db: bool = typer.Option(False, "--no-db")) -> None:
+    """Persistent audit helper used by generated batches (reads requests on stdin).
+
+    Records audit information only; never touches migration files."""
+    from migrator import audit as A
+    server = A.AuditServer(A.Spool(run_dir / "audit-spool"), _dsn_for_run_dir(run_dir, no_db))
+    server.serve(0, 1)
+
+
 @audit_app.command("sync")
 @guarded
 def audit_sync(run: str = RunOpt) -> None:

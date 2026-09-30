@@ -273,3 +273,44 @@ ACL_DIR = os.environ.get("MIGRATOR_ACL_TEST_DIR")
 @pytest.mark.skipif(not ACL_DIR, reason="set MIGRATOR_ACL_TEST_DIR to a directory on the production dataset")
 def test_acl_inheritance_on_the_production_filesystem(tmp_path):
     pytest.skip("run scripts/verify_acl_inheritance.sh on the real target host (see README)")
+
+
+def test_process_mode_fallback_produces_the_same_events(env):
+    ctx, script = setup_ops(env, {"a.mkv": b"payload"})
+    r = env.run_batch(script, AUDIT_MODE="process")
+    assert r.returncode == 0 and dst(env).read_bytes() == b"payload"
+    t = types(ctx, "a.mkv")
+    assert t[0] == "BATCH_OPERATION_STARTED" and t[-1] == "OPERATION_COMPLETED" and len(t) == 11
+    assert A.verify_run_chain(ctx.conn, ctx.run_id).ok
+
+
+def test_audit_helper_dying_mid_batch_stops_before_the_next_state_change(env):
+    ctx, script = setup_ops(env, {"a.mkv": b"1", "b.mkv": b"2"})
+    dying = env.tmp / "dying-migrator"
+    dying.write_text(f"""#!{__import__('sys').executable}
+import os, sys
+if sys.argv[1:3] == ["audit", "serve"]:
+    os.read(0, 100)              # answer the PING, then die
+    os.write(1, b"OK\\n")
+    sys.exit(0)
+os.execv(sys.executable, [sys.executable, "-m", "migrator", *sys.argv[1:]])
+""")
+    dying.chmod(0o755)
+    r = env.run_batch(script, MIGRATOR_BIN=str(dying))
+    assert r.returncode == 2 and "cannot durably record" in r.stderr
+    assert (env.src / "a.mkv").exists() and (env.src / "b.mkv").exists()
+    assert not (env.lib / "MOVIES").exists() or not list((env.lib / "MOVIES").rglob("*"))
+
+
+def test_helper_that_cannot_start_falls_back_to_per_event_emit(env):
+    ctx, script = setup_ops(env, {"a.mkv": b"payload"})
+    nohelper = env.tmp / "nohelper"
+    nohelper.write_text(f"""#!{__import__('sys').executable}
+import os, sys
+if sys.argv[1:3] == ["audit", "serve"]:
+    sys.exit(1)
+os.execv(sys.executable, [sys.executable, "-m", "migrator", *sys.argv[1:]])
+""")
+    nohelper.chmod(0o755)
+    r = env.run_batch(script, MIGRATOR_BIN=str(nohelper))
+    assert r.returncode == 0 and "falling back" in r.stderr and dst(env).exists()

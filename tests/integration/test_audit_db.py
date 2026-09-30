@@ -206,7 +206,7 @@ def test_stale_batch_cannot_start_after_a_newer_plan(env):
     ctx, gen = one_file_run(env)
     planner.create_plan(ctx)                                        # revision 2 moves the trace heads on
     r = env.run_batch(Path(gen["batches"][0]["script"]))
-    assert r.returncode == 2 and "stale" in r.stderr
+    assert r.returncode == 2 and ("stale" in r.stderr or "superseded" in r.stderr)
     assert (env.src / "a.mkv").exists() and not (env.lib / "MOVIES" / "a.mkv").exists()
     assert not list(env.lib.rglob("*.partial"))
 

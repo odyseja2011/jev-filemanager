@@ -63,16 +63,17 @@ def classify_outcome(src_state: str, tgt_state: str, expected: str,
 
 def reconcile(ctx: RunContext, *, hasher: Callable[..., HashResult] = hash_file) -> dict[str, Any]:
     conn, cfg = ctx.conn, ctx.cfg
-    db.require_state(ctx.refresh(), C.BATCHES_GENERATED, C.EXTERNAL_EXECUTION_OBSERVED, C.RECONCILED)
+    db.require_state(ctx.refresh(), C.BATCHES_GENERATED, C.EXTERNAL_EXECUTION_OBSERVED, C.RECONCILING,
+                     C.RECONCILED)
     plan = latest_plan(conn, ctx.run_id)
     if plan is None:
         raise ReconcileError("no plan exists")
     plan_id = str(plan["plan_id"])
     # Bring locally spooled Bash events into PostgreSQL first so the chains stay linear.
-    sync = A.sync_spool(conn, ctx.run_id, ctx.spool)
-    if not sync.ok:
-        raise ReconcileError("audit spool could not be synchronized; fix first:\n  "
-                             + "\n  ".join(str(p) for p in sync.problems[:20]))
+    try:
+        A.require_spool_synced(conn, ctx.run_id, ctx.spool)
+    except A.AuditError as exc:
+        raise ReconcileError(str(exc)) from exc
     with conn.transaction():
         if ctx.run["state"] == C.BATCHES_GENERATED:
             db.transition(conn, ctx.run_id, C.EXTERNAL_EXECUTION_OBSERVED, "observed by reconcile")

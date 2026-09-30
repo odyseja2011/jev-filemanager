@@ -401,6 +401,27 @@ class Spool:
                 "traces": len(self.traces())}
 
 
+def _check_batch_not_stale(conn: psycopg.Connection, trace_id: str, expect_sequence: int,
+                           expect_hash: str) -> None:
+    """A batch may only continue a trace from the head recorded when it was generated.
+
+    After that point the trace may contain Bash events (this or an earlier run of the batch) and
+    read-only reconciliation events, but no planning/review events: those mean a newer plan
+    superseded the batch.  Checked on *every* emit, not just the first one of an operation.
+    """
+    r = conn.execute("SELECT event_hash FROM audit_event WHERE trace_id = %s AND sequence_no = %s",
+                     (trace_id, expect_sequence)).fetchone()
+    if r is None or r["event_hash"].strip() != expect_hash:
+        raise StaleChainError(f"the batch expects trace head {expect_sequence}:{expect_hash[:12]}, "
+                              "which PostgreSQL does not contain; the batch is stale")
+    later = conn.execute("SELECT sequence_no, event_type, source FROM audit_event WHERE trace_id = %s "
+                         "AND sequence_no > %s AND source NOT IN (%s, %s) ORDER BY sequence_no LIMIT 1",
+                         (trace_id, expect_sequence, C.SRC_BASH, C.SRC_RECONCILER)).fetchone()
+    if later is not None:
+        raise StaleChainError(f"trace moved on after this batch was generated ({later['event_type']} at "
+                              f"sequence {later['sequence_no']}); the batch is stale")
+
+
 @dataclass
 class EmitResult:
     event: AuditEvent
@@ -448,21 +469,7 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
             else:
                 head = (expect_sequence, expect_hash)
                 if db_head is not None and db_head != head:
-                    # Reconciliation (read-only observation) may legitimately append events to the
-                    # trace before a batch runs.  Anything else (e.g. a newer plan) makes it stale.
-                    benign = False
-                    if db_head[0] > expect_sequence:
-                        r = conn.execute("SELECT event_hash FROM audit_event WHERE trace_id = %s "
-                                         "AND sequence_no = %s", (trace_id, expect_sequence)).fetchone()
-                        later = conn.execute("SELECT source FROM audit_event WHERE trace_id = %s "
-                                             "AND sequence_no > %s", (trace_id, expect_sequence)).fetchall()
-                        benign = bool(r and r["event_hash"].strip() == expect_hash
-                                      and all(x["source"] == C.SRC_RECONCILER for x in later))
-                    if not benign:
-                        raise StaleChainError(
-                            f"trace head in PostgreSQL is {db_head[0]}:{db_head[1][:12]} but the batch "
-                            f"expects {expect_sequence}:{expect_hash[:12]}; the batch is stale")
-                    head = db_head
+                    head = db_head      # only reconciler events may lie in between (checked below)
         elif db_head is not None and db_head[0] > head[0]:
             # The database moved on (e.g. reconciliation events).  Continue from its head, but only
             # if our own last event is really part of that chain.
@@ -472,6 +479,8 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
                 raise StaleChainError("local spool and PostgreSQL disagree about this trace; "
                                       "run `audit sync` and inspect the divergence")
             head = db_head
+        if conn is not None and expect_sequence is not None and expect_hash is not None:
+            _check_batch_not_stale(conn, trace_id, expect_sequence, expect_hash)
         spec = EventSpec(uuid.UUID(trace_id), event_type, actor, source, payload or {},
                          uuid.UUID(file_id) if file_id else None,
                          uuid.UUID(operation_id) if operation_id else None,
@@ -720,3 +729,16 @@ def sync_spool(conn: psycopg.Connection, run_id: uuid.UUID | str, spool: Spool) 
                 if ev.sequence_no > hseq:
                     spool.mark_synced(path)
     return rep
+
+
+def require_spool_synced(conn: psycopg.Connection, run_id, spool: Spool) -> None:
+    """Import pending Bash events before Python appends to the same traces.
+
+    Otherwise Python would write new events at sequence numbers the unsynced spool already
+    uses, and the spooled history could never be imported (permanent DIVERGED)."""
+    if spool.counts()["pending"] == 0:
+        return
+    rep = sync_spool(conn, run_id, spool)
+    if not rep.ok:
+        raise AuditError("the local audit spool cannot be synchronized; resolve this before continuing:\n  "
+                         + "\n  ".join(str(p) for p in rep.problems[:20]))

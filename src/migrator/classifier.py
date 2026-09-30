@@ -322,7 +322,12 @@ class Classifier:
         roots = sorted((n for n in nodes.values() if n.parent is None), key=lambda n: n.absolute_path)
         dir_level: list[DirNode] = []
         file_dirs: list[DirNode] = []
-        for root in roots:      # the configured root itself is never routed as a subtree
+        for root in roots:      # Jev never routes a configured root as a whole subtree
+            e = eff.get((C.SUBJECT_DIRECTORY, root.directory_id))
+            if e is not None and e.source == C.SOURCE_HUMAN:
+                if not e.applies_to_subtree:       # human routed the root's direct files only
+                    dir_level.extend(root.children)
+                continue                           # human subtree decision: nothing left to ask
             file_dirs.append(root)
             dir_level.extend(root.children)
         level = 0
@@ -396,8 +401,8 @@ def resolve_routes(ctx: RunContext) -> dict[str, int]:
             inh, _own, hold = state[node.parent.directory_id]
         own: Assign | None = None
         dec = eff.get((C.SUBJECT_DIRECTORY, node.directory_id))
-        if node.parent is None:
-            pass
+        if node.parent is None and (dec is None or dec.source != C.SOURCE_HUMAN):
+            pass                  # Jev never routes a configured root as a whole; humans may
         elif dec is None:
             if inh is None and hold is None:
                 hold = "MAX_DEPTH" if node.depth > max_depth else "NOT_CLASSIFIED"
@@ -534,6 +539,7 @@ def write_decisions_jsonl(ctx: RunContext) -> Path:
 def run_classification(ctx: RunContext, client: J.JevClient) -> dict[str, Any]:
     conn = ctx.conn
     db.require_state(ctx.refresh(), C.INVENTORY_COMPLETE, C.CLASSIFYING, C.CLASSIFIED, C.REVIEW_REQUIRED)
+    A.require_spool_synced(conn, ctx.run_id, ctx.spool)
     with conn.transaction():
         db.transition(conn, ctx.run_id, C.CLASSIFYING)
         A.append_event(conn, ctx.run_id, A.EventSpec(
@@ -607,6 +613,13 @@ def _actor() -> str:
         return "unknown"
 
 
+def _check_uuid(value: str, what: str) -> None:
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        raise ClassifyError(f"{what} id {value!r} is not a UUID") from None
+
+
 def _check_target(ctx: RunContext, target: str) -> None:
     if target not in ctx.cfg.target_ids:
         raise ClassifyError(f"unknown target {target!r}; configured: {', '.join(ctx.cfg.target_ids)}")
@@ -630,6 +643,8 @@ def _human_decision(ctx: RunContext, subject_type: str, subject_id: str, target:
 
 def set_file_target(ctx: RunContext, file_id: str, target: str, *, resolve: bool = True) -> str:
     _check_target(ctx, target)
+    _check_uuid(file_id, "file")
+    A.require_spool_synced(ctx.conn, ctx.run_id, ctx.spool)
     row = ctx.conn.execute("SELECT file_id, trace_id, absolute_path FROM file_inventory "
                            "WHERE run_id = %s AND file_id = %s AND root_type = 'SOURCE'",
                            (ctx.run_id, file_id)).fetchone()
@@ -649,6 +664,8 @@ def set_file_target(ctx: RunContext, file_id: str, target: str, *, resolve: bool
 def set_directory_target(ctx: RunContext, directory_id: str, target: str, *, subtree: bool,
                          resolve: bool = True) -> str:
     _check_target(ctx, target)
+    _check_uuid(directory_id, "directory")
+    A.require_spool_synced(ctx.conn, ctx.run_id, ctx.spool)
     row = ctx.conn.execute(
         """SELECT d.directory_id, d.absolute_path FROM directory_inventory d JOIN scan_root r USING (scan_root_id)
            WHERE d.run_id = %s AND d.directory_id = %s AND r.root_type = 'SOURCE'""",
@@ -686,13 +703,32 @@ def import_review_csv(ctx: RunContext, path: str | Path) -> dict[str, int]:
         else:
             todo.append((kind, (row.get("subject_id") or "").strip(), target,
                          (row.get("human_subtree") or "").strip().lower() in ("1", "true", "yes", "y")))
-    if errors:
-        raise ClassifyError("review import rejected:\n  " + "\n  ".join(errors))
-    for kind, sid, target, subtree in todo:
+    for n, (kind, sid, _t, _s) in enumerate(todo):
+        try:
+            uuid.UUID(sid)
+        except ValueError:
+            errors.append(f"row {n + 1} with a target: subject_id {sid!r} is not a UUID")
+            continue
         if kind == C.SUBJECT_FILE:
-            set_file_target(ctx, sid, target, resolve=False)
+            ok = ctx.conn.execute("SELECT 1 FROM file_inventory WHERE run_id = %s AND file_id = %s "
+                                  "AND root_type = 'SOURCE'", (ctx.run_id, sid)).fetchone()
         else:
-            set_directory_target(ctx, sid, target, subtree=subtree, resolve=False)
-    routes = resolve_routes(ctx) if todo else {}
+            ok = ctx.conn.execute("""SELECT 1 FROM directory_inventory d JOIN scan_root r USING (scan_root_id)
+                                     WHERE d.run_id = %s AND d.directory_id = %s AND r.root_type = 'SOURCE'""",
+                                  (ctx.run_id, sid)).fetchone()
+        if not ok:
+            errors.append(f"{kind} {sid} is not a SOURCE {kind.lower()} of this run")
+    if errors:
+        raise ClassifyError("review import rejected (nothing was applied):\n  " + "\n  ".join(errors))
+    A.require_spool_synced(ctx.conn, ctx.run_id, ctx.spool)
+    routes: dict[str, int] = {}
+    with ctx.conn.transaction():          # all rows or none
+        for kind, sid, target, subtree in todo:
+            if kind == C.SUBJECT_FILE:
+                set_file_target(ctx, sid, target, resolve=False)
+            else:
+                set_directory_target(ctx, sid, target, subtree=subtree, resolve=False)
+        if todo:
+            routes = resolve_routes(ctx)
     write_decisions_jsonl(ctx)
     return {"applied": len(todo), **routes}

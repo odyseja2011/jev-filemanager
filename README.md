@@ -206,5 +206,7 @@ source and target trees are byte-for-byte unchanged; only the generated Bash cha
    round-trips become the bottleneck.
 7. Scale has been exercised with hundreds of files, not millions; `plan create` keeps the operations
    of one plan in memory.
-8. Discovery is not resumable; a real mount boundary (`cross_mounts: false`) is tested with a simulated
+8. After re-planning, `reconcile` works against the latest plan and needs its batches generated. If the
+   new revision has no READY operations, the run never reaches `BATCHES_GENERATED` and `reconcile` refuses.
+9. Discovery is not resumable; a real mount boundary (`cross_mounts: false`) is tested with a simulated
    `st_dev`, not a real second filesystem.

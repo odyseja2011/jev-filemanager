@@ -166,6 +166,9 @@ preflight() {
         [[ -r $plan_sidecar ]] || { log "preflight: missing $plan_sidecar"; return 1; }
         expected="$(cut -d' ' -f1 < "$plan_sidecar")"
         [[ "$expected" == "$PLAN_SHA256" ]] || { log "preflight: plan SHA-256 differs from the one this batch was generated for"; return 1; }
+        if [[ -e "$RUN_DIR/plan/plan-$(printf '%04d' $((PLAN_REVISION + 1))).sha256" ]]; then
+            log "preflight: plan revision $PLAN_REVISION has been superseded; this batch must not run"; return 1
+        fi
     fi
 }
 
@@ -386,6 +389,7 @@ def _cleanup(paths: list[Path]) -> None:
 def generate_batches(ctx: RunContext) -> dict[str, Any]:
     conn, cfg = ctx.conn, ctx.cfg
     db.require_state(ctx.refresh(), C.PLAN_READY, C.BATCHES_GENERATED)
+    A.require_spool_synced(conn, ctx.run_id, ctx.spool)
     plan = latest_plan(conn, ctx.run_id)
     if plan is None:
         raise BatchError("no plan exists; run `plan create` first")

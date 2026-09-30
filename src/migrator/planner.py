@@ -189,6 +189,7 @@ def create_plan(ctx: RunContext, *, revalidate: bool = True) -> dict[str, Any]:
     conn, cfg = ctx.conn, ctx.cfg
     db.require_state(ctx.refresh(), C.CLASSIFIED, C.REVIEW_REQUIRED, C.PLANNING, C.PLAN_READY,
                     C.BATCHES_GENERATED)
+    A.require_spool_synced(conn, ctx.run_id, ctx.spool)
     with conn.transaction():
         db.transition(conn, ctx.run_id, C.PLANNING)
     routes = resolve_routes(ctx)

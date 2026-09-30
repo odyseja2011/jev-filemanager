@@ -346,6 +346,18 @@ def write_manifests(ctx: RunContext) -> dict[str, str]:
     return out
 
 
+def _unesc(s: str) -> str:
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            out.append("\t" if s[i + 1] == "t" else s[i + 1])
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def read_manifest(path: str | os.PathLike) -> Iterator[dict[str, str]]:
     """Parse a manifest produced by `write_manifests`."""
     with gzip.open(path, "rb") as f:
@@ -357,7 +369,7 @@ def read_manifest(path: str | os.PathLike) -> Iterator[dict[str, str]]:
     for rec in records[1:]:
         fields = []
         for part in rec.decode("utf-8").split("\t"):
-            fields.append(part.replace("\\t", "\t").replace("\\\\", "\\"))
+            fields.append(_unesc(part))
         yield dict(zip(header, fields))
 
 

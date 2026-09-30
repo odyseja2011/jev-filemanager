@@ -25,13 +25,42 @@ Python application                          Generated Bash (run by a human)
 
 ## Install
 
+### 1. Where to run it
+
+Run the planner **and** the generated batches on a machine that sees the datasets at exactly the paths
+in your config (e.g. `/mnt/data/MEDIA`). Batch scripts contain absolute paths; running them where the
+paths differ makes every operation fail its precheck (nothing is changed, but nothing moves either).
+
+On TrueNAS SCALE, don't install Python packages on the appliance OS itself. Use a sandbox that mounts the
+datasets at the same paths (a jail/sandbox, a container or a VM), running as the user whose writes
+should produce the destination permissions you want.
+
+### 2. PostgreSQL
+
+Any PostgreSQL ≥ 13 works (the tests use 16). Create a database and a user once, e.g.:
+
 ```bash
-python -m venv .venv && . .venv/bin/activate
+sudo -u postgres psql -c "CREATE USER migrator WITH PASSWORD 'change-me';"
+sudo -u postgres psql -c "CREATE DATABASE migrator OWNER migrator;"
+```
+
+### 3. The application
+
+```bash
+git clone https://github.com/odyseja2011/jev-filemanager.git && cd jev-filemanager
+python3 -m venv .venv && . .venv/bin/activate          # Python >= 3.11
 pip install -e '.[dev]'
-export MIGRATOR_DATABASE_URL='postgresql://user:pass@host/dbname'
+export MIGRATOR_DATABASE_URL='postgresql://migrator:change-me@localhost/migrator'
 export OPENROUTER_API_KEY='...'
 migrator db migrate
+migrator db status
+pytest tests/unit                                       # quick self-check, no database needed
+OPENROUTER_API_KEY=... pytest -m live_jev               # checks the real Jev API answers as expected
 ```
+
+Copy `examples/media-migration.yaml`, then set `workspace.path` to a directory outside every source and
+target root. Keep the `export` lines in a file only you can read (`chmod 600`) and `source` it before
+using the tool and before running batches. The batches need both variables too.
 
 The SQL migrations are read from the repository's `sql/` directory (an editable install finds it
 automatically; otherwise set `MIGRATOR_SQL_DIR`). Applied migrations are checksummed: editing one after
@@ -74,6 +103,27 @@ command, and `batches generate` reports how many were excluded. If review decisi
 `plan create` again: it makes revision N+1. Batches of older revisions stay on disk as evidence but
 `batches verify` flags them as superseded and their first audit event is refused (stale chain head).
 Revision 1 batches live in `batches/`, later revisions in `batches/plan-000N/`.
+
+### First trial: checklist
+
+1. **Snapshot first.** `zfs snapshot -r pool/data@pre-migration` (or the TrueNAS UI) for the source and
+   target datasets. This is your real undo; the tool never deletes anything by itself, but the batches do.
+2. Start with a **small config** (a copy or one subdirectory of the media), not the whole library.
+3. `scripts/verify_acl_inheritance.sh /mnt/data/MEDIA_LIBRARY/MOVIES` as the batch user; compare the
+   ACL it prints with a file created normally in that directory.
+4. Create the run, `inventory`, `run summary`: check counts, symlinks skipped, hash failures.
+5. `classify`, `review list`, then read `plan/plan-0001.jsonl` and `reports/conflicts.csv` after
+   `plan create`: every planned move with source, target and SHA-256 is listed there.
+6. `batches generate`, `batches verify`, **read `batch_000001.sh`**, run it, then `audit sync`,
+   `reconcile`, `audit verify-chain`, `run summary`.
+7. Undo if needed: `zfs rollback` to the snapshot (also discards everything written after it).
+
+### Finding ids for `review set`
+
+`review list` prints each file's id first; `review export` writes `subject_id` and
+`parent_directory_id` columns. The easiest workflow is: export, fill `human_target` (and
+`human_subtree=yes` on a DIRECTORY row), import. The import is all-or-nothing. To route a whole
+directory, copy the row, set `kind=DIRECTORY` and `subject_id` to the `parent_directory_id` shown.
 
 ### Batch script controls
 

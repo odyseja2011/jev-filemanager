@@ -345,7 +345,7 @@ def _cleanup(paths: list[Path]) -> None:
 
 def generate_batches(ctx: RunContext) -> dict[str, Any]:
     conn, cfg = ctx.conn, ctx.cfg
-    db.require_state(ctx.refresh(), C.PLAN_READY)
+    db.require_state(ctx.refresh(), C.PLAN_READY, C.BATCHES_GENERATED)
     plan = latest_plan(conn, ctx.run_id)
     if plan is None:
         raise BatchError("no plan exists; run `plan create` first")
@@ -395,8 +395,11 @@ def generate_batches(ctx: RunContext) -> dict[str, Any]:
                                  str(ctx.run_dir), now, script_name)
                 text = render_batch_script(meta, ops).encode("utf-8")
                 digest = sha256_hex(text)
-                script_path = ctx.path("batches", script_name)
-                sha_path = ctx.path("batches", f"batch_{bn:06d}.sha256")
+                # revision 1 keeps the documented layout; later revisions get their own directory so
+                # older (superseded) batches stay intact as historical evidence
+                sub = [] if plan["revision"] == 1 else [f"plan-{plan['revision']:04d}"]
+                script_path = ctx.path("batches", *sub, script_name)
+                sha_path = ctx.path("batches", *sub, f"batch_{bn:06d}.sha256")
                 write_new_file(script_path, text, mode=0o555, guard=ctx.guard)
                 written.append(script_path)
                 write_new_file(sha_path, f"{digest}  {script_name}\n".encode(), guard=ctx.guard)
@@ -423,7 +426,9 @@ def generate_batches(ctx: RunContext) -> dict[str, Any]:
         _cleanup(written)
         raise
     return {"plan_id": plan_id, "batches": batches_info, "ready_operations": len(rows),
-            "excluded_operations": excluded, "batch_dir": str(ctx.run_dir / "batches")}
+            "excluded_operations": excluded,
+            "batch_dir": str(ctx.run_dir / "batches" / ("" if plan["revision"] == 1 else f"plan-{plan['revision']:04d}"))
+            .rstrip("/")}
 
 
 def list_batches(ctx: RunContext) -> list[dict[str, Any]]:

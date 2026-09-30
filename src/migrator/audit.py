@@ -439,11 +439,23 @@ def emit_event(spool: Spool, *, run_id: str, trace_id: str, event_type: str, act
                     raise AuditError("no chain head known: pass --expect-sequence/--expect-hash")
                 head = db_head
             else:
-                if db_head is not None and db_head != (expect_sequence, expect_hash):
-                    raise StaleChainError(
-                        f"trace head in PostgreSQL is {db_head[0]}:{db_head[1][:12]} but the batch "
-                        f"expects {expect_sequence}:{expect_hash[:12]}; the batch is stale")
                 head = (expect_sequence, expect_hash)
+                if db_head is not None and db_head != head:
+                    # Reconciliation (read-only observation) may legitimately append events to the
+                    # trace before a batch runs.  Anything else (e.g. a newer plan) makes it stale.
+                    benign = False
+                    if db_head[0] > expect_sequence:
+                        r = conn.execute("SELECT event_hash FROM audit_event WHERE trace_id = %s "
+                                         "AND sequence_no = %s", (trace_id, expect_sequence)).fetchone()
+                        later = conn.execute("SELECT source FROM audit_event WHERE trace_id = %s "
+                                             "AND sequence_no > %s", (trace_id, expect_sequence)).fetchall()
+                        benign = bool(r and r["event_hash"].strip() == expect_hash
+                                      and all(x["source"] == C.SRC_RECONCILER for x in later))
+                    if not benign:
+                        raise StaleChainError(
+                            f"trace head in PostgreSQL is {db_head[0]}:{db_head[1][:12]} but the batch "
+                            f"expects {expect_sequence}:{expect_hash[:12]}; the batch is stale")
+                    head = db_head
         elif db_head is not None and db_head[0] > head[0]:
             # The database moved on (e.g. reconciliation events).  Continue from its head, but only
             # if our own last event is really part of that chain.

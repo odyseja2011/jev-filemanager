@@ -30,9 +30,10 @@ class Env:
     def new_run(self, config: Path | None = None):
         return create_run(self.conn, config or self.config)
 
-    def run_batch(self, script: Path, **extra_env):
-        env = dict(os.environ, MIGRATOR_DATABASE_URL=self.dsn, MIGRATOR_BIN=str(self.wrapper), **extra_env)
-        return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    def run_batch(self, script: Path, umask: int | None = None, **extra_env):
+        env = {**os.environ, "MIGRATOR_DATABASE_URL": self.dsn, "MIGRATOR_BIN": str(self.wrapper), **extra_env}
+        return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env,
+                              preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
 
 
 def populate(src: Path) -> None:

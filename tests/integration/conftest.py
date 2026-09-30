@@ -54,10 +54,9 @@ def populate(src: Path) -> None:
 
 
 @pytest.fixture()
-def env(tmp_path, pg_dsn, conn):
+def bare_env(tmp_path, pg_dsn, conn):
     src, lib, ws = tmp_path / "MEDIA", tmp_path / "LIBRARY", tmp_path / "workspace"
     src.mkdir()
-    populate(src)
     for t in ("MOVIES", "SERIES", "MUSIC", "BOOKS"):
         (lib / t).mkdir(parents=True)
     cfg = write_config(tmp_path)
@@ -65,6 +64,29 @@ def env(tmp_path, pg_dsn, conn):
     wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} -m migrator \"$@\"\n")
     wrapper.chmod(0o755)
     return Env(tmp_path, pg_dsn, conn, cfg, src, lib, ws, wrapper)
+
+
+@pytest.fixture()
+def env(bare_env):
+    populate(bare_env.src)
+    return bare_env
+
+
+def all_movies(state, question):
+    return ("MOVIES", 0.99)
+
+
+def ready_run(env, files, rules=None, config=None, **cfg_over):
+    """Create files under MEDIA, then run create/inventory/classify/plan.  Returns (ctx, fake)."""
+    from migrator import classifier, inventory, planner
+    write_files(env.src, files)
+    cfg = config or (write_config(env.tmp, **cfg_over) if cfg_over else env.config)
+    fake = FakeJev(rules or all_movies)
+    ctx = env.new_run(cfg)
+    inventory.run_inventory(ctx)
+    classifier.run_classification(ctx, fake)
+    planner.create_plan(ctx)
+    return ctx, fake
 
 
 @pytest.fixture()

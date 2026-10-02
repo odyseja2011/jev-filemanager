@@ -79,3 +79,15 @@ def test_commands_refuse_to_run_out_of_order(bare_env):
     hist = [r["to_state"] for r in ctx.conn.execute(
         "SELECT to_state FROM run_state_history WHERE run_id=%s ORDER BY id", (ctx.run_id,))]
     assert hist == ["CREATED", "DISCOVERING", "DISCOVERY_COMPLETE", "HASHING", "INVENTORY_COMPLETE"]
+
+
+def test_non_utf8_database_is_refused(pg_admin_dsn):
+    name = "t_" + uuid.uuid4().hex[:12]
+    with psycopg.connect(pg_admin_dsn, autocommit=True) as c:
+        c.execute(f"CREATE DATABASE \"{name}\" ENCODING 'SQL_ASCII' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'")
+    try:
+        with pytest.raises(db.DatabaseError, match="needs a UTF8 database"):
+            db.connect(psycopg.conninfo.make_conninfo(pg_admin_dsn, dbname=name))
+    finally:
+        with psycopg.connect(pg_admin_dsn, autocommit=True) as c:
+            c.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')

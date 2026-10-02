@@ -39,7 +39,13 @@ def connect(dsn: str | None = None, *, dsn_env: str = DEFAULT_DSN_ENV,
     kwargs: dict[str, Any] = {"row_factory": dict_row, "autocommit": autocommit}
     if connect_timeout is not None:
         kwargs["connect_timeout"] = connect_timeout
-    return psycopg.connect(dsn or get_dsn(dsn_env), **kwargs)
+    conn = psycopg.connect(dsn or get_dsn(dsn_env), **kwargs)
+    enc = conn.info.parameter_status("server_encoding")
+    if enc != "UTF8":
+        conn.close()
+        raise DatabaseError(f"database encoding is {enc}; the migrator needs a UTF8 database "
+                            "(CREATE DATABASE ... ENCODING 'UTF8' TEMPLATE template0)")
+    return conn
 
 
 def sql_dir() -> Path:

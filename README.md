@@ -41,8 +41,11 @@ Any PostgreSQL ≥ 13 works (the tests use 16). Create a database and a user onc
 
 ```bash
 sudo -u postgres psql -c "CREATE USER migrator WITH PASSWORD 'change-me';"
-sudo -u postgres psql -c "CREATE DATABASE migrator OWNER migrator;"
+sudo -u postgres psql -c "CREATE DATABASE migrator OWNER migrator ENCODING 'UTF8' TEMPLATE template0;"
 ```
+
+The database must be UTF8 (the tool refuses others): paths are stored exactly, and a `SQL_ASCII`
+database would neither validate them nor return them as text.
 
 ### 3. The application
 
@@ -103,6 +106,17 @@ command, and `batches generate` reports how many were excluded. If review decisi
 `plan create` again: it makes revision N+1. Batches of older revisions stay on disk as evidence but
 `batches verify` flags them as superseded and their first audit event is refused (stale chain head).
 Revision 1 batches live in `batches/`, later revisions in `batches/plan-000N/`.
+
+### Edge-case trial on dummy data
+
+`scripts/edge_case_trial.sh` runs the real tool (your PostgreSQL and Jev key) through 14 scenarios
+in throw-away sandboxes under `~/migtest-edge` and prints PASS/FAIL per check: happy path and
+idempotent rerun, Python-never-mutates, source changed after planning, target appearing, resume after
+an interrupted commit, data missing, leftover `.partial`, symlinks/hardlinks, hostile file names,
+collisions with library content, superseded plan, edited script, PostgreSQL down during a batch,
+`STOP_ON_ERROR`, and human overrides. Routing is forced by a human decision, so results don't depend
+on Jev's answers. `scripts/edge_case_trial.sh s03 s08` runs selected scenarios; the log is
+`~/migtest-edge/trial.log`.
 
 ### First trial: checklist
 

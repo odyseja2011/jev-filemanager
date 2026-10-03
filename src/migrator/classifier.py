@@ -214,6 +214,16 @@ class Classifier:
                WHERE cache_key = %s AND cached_from_decision_id IS NULL AND decision_status = 'OK'
                ORDER BY created_at LIMIT 1""", (key,)).fetchone()
 
+    EXECUTE_CHUNK = 500
+
+    def _execute_chunked(self, tasks: list[ClassifyTask], eff: dict) -> None:
+        """Bounded batches: limits memory and commits progress every EXECUTE_CHUNK decisions."""
+        for i in range(0, len(tasks), self.EXECUTE_CHUNK):
+            self.execute(tasks[i:i + self.EXECUTE_CHUNK], eff)
+            if len(tasks) > self.EXECUTE_CHUNK:
+                log.info("  %d/%d requests of this level done", min(i + self.EXECUTE_CHUNK, len(tasks)),
+                         len(tasks), extra={"run_id": self.ctx.run_id})
+
     def execute(self, tasks: list[ClassifyTask], eff: dict) -> list[str]:
         """Resolve tasks (cache, then Jev); persist decisions.  Returns new decision ids
         in task order."""
@@ -351,11 +361,11 @@ class Classifier:
                 file_tasks.extend(self._file_tasks(node, eff))
             log.info("level %d: %d directory and %d file requests", level, len(dir_tasks), len(file_tasks),
                      extra={"run_id": self.ctx.run_id})
-            self.execute(dir_tasks, eff)
+            self._execute_chunked(dir_tasks, eff)
             for node in dir_nodes:
                 self._follow(node, eff[(C.SUBJECT_DIRECTORY, node.directory_id)], target_ids,
                              next_dirs, next_file_dirs)
-            self.execute(file_tasks, eff)
+            self._execute_chunked(file_tasks, eff)
             dir_level, file_dirs = next_dirs, next_file_dirs
         return dict(self.stats)
 
@@ -523,16 +533,23 @@ def resolve_routes(ctx: RunContext) -> dict[str, int]:
 
 
 def write_decisions_jsonl(ctx: RunContext) -> Path:
+    """Stream every decision to decisions.jsonl (server-side cursor; bounded memory)."""
     path = ctx.path("decisions", "decisions.jsonl")
-    lines = []
-    with ctx.conn.cursor() as cur:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    ctx.guard.check(tmp)
+    with open(tmp, "w", encoding="ascii") as out, ctx.conn.transaction(), \
+            ctx.conn.cursor(name="decisions_jsonl") as cur:
+        cur.itersize = 1000
         cur.execute("SELECT * FROM route_decision WHERE run_id = %s ORDER BY created_at, decision_id",
                     (ctx.run_id,))
         for row in cur:
             row = {k: (str(v) if isinstance(v, uuid.UUID) else (v.isoformat() if hasattr(v, "isoformat") else v))
                    for k, v in row.items()}
-            lines.append(json.dumps(row, sort_keys=True, ensure_ascii=True))
-    write_replaceable_file(path, ("\n".join(lines) + ("\n" if lines else "")).encode(), ctx.guard)
+            out.write(json.dumps(row, sort_keys=True, ensure_ascii=True) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
     return path
 
 
